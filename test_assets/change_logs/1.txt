@@ -1,0 +1,27 @@
+### General Fixes
+
+Some fix
+
+Fix something
+
+
+### cmd/update
+
+#### Features
+
+Insert some stuff
+
+This commit will insert some stuff. 
+It is intendet to test if this works or not.
+
+### BREAKING CHANGES
+
+bla
+
+blubb
+
+break something
+
+break some real long thing
+that wraps arround two lines
+

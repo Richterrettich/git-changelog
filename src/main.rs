@@ -3,6 +3,9 @@ use regex::Regex;
 use std::collections::BTreeMap;
 #[macro_use]
 extern crate lazy_static;
+extern crate crossbeam;
+#[macro_use]
+use crossbeam::crossbeam_channel;
 
 fn main() -> Result<(), Box<std::error::Error>> {
     let current_dir = std::env::current_dir()?;
@@ -32,15 +35,26 @@ fn main() -> Result<(), Box<std::error::Error>> {
     revwalk.hide(latest_tag.id())?;
     revwalk.push_head()?;
 
+    let (oid_send, oid_receive) = crossbeam_channel::unbounded::<git2::Oid>();
+    let (report_send, report_receive) = crossbeam_channel::unbounded::<Report>();
+    let mut num_items = 0;
     let reports = revwalk
         .filter_map(|item| item.ok())
-        .filter_map(|rev| repo.find_commit(rev).ok())
-        .filter_map(|commit| commit.message().map(|i| i.to_string()))
-        .filter_map(|message| parse_report(&message));
+        .enumerate()
+        .for_each(|(index, item)| {
+            oid_send.send(item).expect("unable to send oid to workers");
+            num_items = index;
+        });
+    /* .filter_map(|rev| repo.find_commit(rev).ok())
+    .filter_map(|commit| commit.message().map(|i| i.to_string()))
+    .filter_map(|message| parse_report(&message));*/
 
     let mut aggregator = ReportAggregator::new();
-    for report in reports {
+    for (index, report) in report_receive.iter().enumerate() {
         aggregator.add_report(report);
+        if index == num_items {
+            break;
+        }
     }
 
     aggregator.print(std::io::stdout())?;
@@ -117,6 +131,39 @@ fn parse_report(raw_input: &str) -> Option<Report> {
     Some(result)
 }
 
+struct Worker<'a> {
+    oid_receiver: crossbeam_channel::Receiver<git2::Oid>,
+    commit_message_receiver: crossbeam_channel::Receiver<String>,
+    commit_message_sender: crossbeam_channel::Sender<String>,
+    report_sender: crossbeam_channel::Sender<Option<Report>>,
+    repo: &'a git2::Repository,
+}
+
+impl<'a> Worker<'a> {
+    fn run(&self) {
+        crossbeam_channel::select! {
+            recv(self.oid_receiver) -> possible_oid => {
+                let oid = possible_oid.expect("unable to receive oid");
+                let result = self.process_commit(oid);
+                if result.is_err() {
+                    panic!("error while commit lookup: {}",result.err().unwrap());
+                }
+            }
+        };
+    }
+
+    fn process_commit(&self, oid: git2::Oid) -> Result<(), Box<std::error::Error>> {
+        let commit = self.repo.find_commit(oid)?;
+        let message = commit.message().unwrap_or("");
+        if message == "" {
+            return Ok(());
+        }
+        self.commit_message_sender
+            .send(commit.message().unwrap_or("").to_string())?;
+        Ok(())
+    }
+}
+
 fn parse_array(input: &str) -> Vec<String> {
     lazy_static! {
         static ref CLEANER: Regex = Regex::new(r"\s+-\s+").unwrap();
@@ -174,21 +221,39 @@ impl ReportAggregator {
     fn print(&self, mut out: impl std::io::Write) -> std::io::Result<()> {
         for (k, v) in &self.reports {
             if v[FIX_TYPE].len() > 0 || v[FEAT_TYPE].len() > 0 {
-                writeln!(&mut out, "### {}", k)?;
+                if k != "" {
+                    writeln!(&mut out, "### {}\n", k)?;
+                }
             }
 
             if v[FEAT_TYPE].len() > 0 {
-                writeln!(out, "#### Features")?;
+                if k == "" {
+                    writeln!(out, "### General Features\n")?;
+                } else {
+                    writeln!(out, "#### Features\n")?;
+                }
                 for report in &v[FEAT_TYPE] {
                     report.print(&mut out)?;
                 }
+                writeln!(out)?;
             }
 
             if v[FIX_TYPE].len() > 0 {
-                writeln!(out, "#### Fixes");
+                if k == "" {
+                    writeln!(out, "### General Fixes\n")?;
+                } else {
+                    writeln!(out, "#### Fixes\n")?;
+                }
                 for report in &v[FIX_TYPE] {
                     report.print(&mut out)?;
                 }
+                writeln!(out)?;
+            }
+        }
+        if self.breaking_changes.len() > 0 {
+            writeln!(out, "### BREAKING CHANGES\n")?;
+            for bc in &self.breaking_changes {
+                writeln!(out, "{}\n", bc)?;
             }
         }
         Ok(())
@@ -201,8 +266,12 @@ const FEAT_TYPE: usize = 0;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
+    use std::io::prelude::*;
+
     #[test]
     fn it_should_parse_reports() {
+        let update_golden = std::env::var("UPDATE_GOLDEN");
         let test_table = vec![Report {
             header: "Insert some stuff".to_string(),
             description: Some(
@@ -235,9 +304,12 @@ mod tests {
         },
         ];
 
+        let mut aggregator = ReportAggregator::new();
+        let mut test_assets_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        test_assets_path.push("test_assets");
         for (i, expected) in test_table.iter().enumerate() {
-            let mut d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            d.push(format!("test_assets/commit_messages/{}.txt", i + 1));
+            let mut d = test_assets_path.clone();
+            d.push(format!("commit_messages/{}.txt", i + 1));
 
             let commit_message =
                 std::fs::read_to_string(d).expect("unable to read commit message file");
@@ -253,5 +325,38 @@ mod tests {
             assert_eq!(expected.related_issues, report.related_issues);
             assert_eq!(expected.breaking_changes, report.breaking_changes);
         }
+
+        for rep in test_table {
+            aggregator.add_report(rep);
+        }
+        let mut change_log_path = test_assets_path.clone();
+        change_log_path.push("change_logs/1.txt");
+        if update_golden.is_ok() {
+            let f =
+                std::fs::File::create(&change_log_path).expect("unable to create change logs file");
+
+            let result = aggregator.print(f);
+            assert!(result.is_ok());
+            return;
+        }
+
+        let mut output = Vec::new();
+        let result = aggregator.print(&mut output);
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                let desc = e.description().to_string();
+                panic!(desc);
+            }
+        }
+
+        let mut f =
+            std::fs::File::open(&change_log_path).expect("unable to open ch ange logs file");
+        let mut expected_content = String::new();
+        f.read_to_string(&mut expected_content)
+            .expect("unable to read changelog file");
+
+        let actual = String::from_utf8_lossy(&output).into_owned();
+        assert_eq!(expected_content, actual);
     }
 }
