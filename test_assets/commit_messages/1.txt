@@ -1,0 +1,16 @@
+feat(cmd/update): Insert some stuff
+
+This commit will insert some stuff. 
+It is intendet to test if this works or not.
+
+solves:
+  - hallo
+  - welt
+
+related:
+  - foo
+  - bar
+  
+BREAKING_CHANGES:
+  - bla
+  - blubb
