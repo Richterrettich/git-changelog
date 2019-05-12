@@ -4,57 +4,67 @@ use std::collections::BTreeMap;
 #[macro_use]
 extern crate lazy_static;
 extern crate crossbeam;
-#[macro_use]
 use crossbeam::crossbeam_channel;
 
 fn main() -> Result<(), Box<std::error::Error>> {
-    let current_dir = std::env::current_dir()?;
-    let repo = Repository::open(current_dir)?;
-    let mut revwalk = repo.revwalk()?;
-    let tags = repo.tag_names(None)?;
-    let mut reports: Vec<git2::Commit> = tags
-        .iter()
-        .filter(|possible_tag| possible_tag.is_some())
-        .map(|t| t.unwrap())
-        .map(|raw_tag| {
-            repo.revparse_single(raw_tag)
-                .expect("unable to find reference for tag")
-                .as_commit()
-                .unwrap()
-                .to_owned()
-        })
-        .collect();
-    reports.sort_by(|a, b| a.time().seconds().cmp(&b.time().seconds()));
-
-    let possible_latest_tag = reports.last();
-    if possible_latest_tag.is_none() {
-        println!("no tags found. exiting");
-        return Ok(());
+    let mut num = num_cpus::get();
+    if num > 1 {
+        num = num - 1;
     }
-    let latest_tag = possible_latest_tag.unwrap();
-    revwalk.hide(latest_tag.id())?;
-    revwalk.push_head()?;
+    let current_dir = std::env::current_dir()?;
+    let repo = Repository::open(&current_dir)?;
+    let mut revwalk = repo.revwalk()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.len() == 0 {
+        let possible_id = find_latest_tag_commit_id(&repo)?;
+        if possible_id.is_none() {
+            println!("no tags found");
+            return Ok(());
+        }
+        revwalk.hide(possible_id.unwrap())?;
+        revwalk.push_head()?;
+    } else {
+        let range = &args[0];
+        if !range.contains("..") {
+            revwalk.push(repo.revparse_single(range)?.id())?;
+        } else {
+            revwalk.push_range(&range[..])?;
+        }
+    }
+
+    let revs: Vec<git2::Oid> = revwalk.filter_map(|item| item.ok()).collect();
 
     let (oid_send, oid_receive) = crossbeam_channel::unbounded::<git2::Oid>();
     let (report_send, report_receive) = crossbeam_channel::unbounded::<Report>();
-    let mut num_items = 0;
-    let reports = revwalk
-        .filter_map(|item| item.ok())
-        .enumerate()
-        .for_each(|(index, item)| {
-            oid_send.send(item).expect("unable to send oid to workers");
-            num_items = index;
+
+    if revs.len() < num {
+        num = revs.len();
+    }
+    for _ in 0..num {
+        let dir = current_dir.clone();
+        let rs = report_send.clone();
+        let or = oid_receive.clone();
+        std::thread::spawn(move || {
+            let repo = Repository::open(dir).expect("unable to open repository");
+            let w = Worker {
+                oid_receiver: or,
+                repo: repo,
+                report_sender: rs,
+            };
+            w.run();
         });
-    /* .filter_map(|rev| repo.find_commit(rev).ok())
-    .filter_map(|commit| commit.message().map(|i| i.to_string()))
-    .filter_map(|message| parse_report(&message));*/
+    }
+
+    for item in revs {
+        oid_send.send(item).expect("unable to send oid to workers");
+    }
+    drop(oid_send);
+    drop(report_send);
 
     let mut aggregator = ReportAggregator::new();
-    for (index, report) in report_receive.iter().enumerate() {
+    for report in report_receive.iter() {
         aggregator.add_report(report);
-        if index == num_items {
-            break;
-        }
     }
 
     aggregator.print(std::io::stdout())?;
@@ -63,7 +73,8 @@ fn main() -> Result<(), Box<std::error::Error>> {
 }
 fn parse_report(raw_input: &str) -> Option<Report> {
     lazy_static! {
-        static ref SPLITTER: Regex = Regex::new(r"\n(\n|\s+\n)+").unwrap();
+        static ref SPLITTER: Regex =
+            Regex::new(r"\n(\n|\s+\n)+").expect("unable to parse report regex");
     }
 
     let mut split = SPLITTER.split(raw_input);
@@ -131,25 +142,51 @@ fn parse_report(raw_input: &str) -> Option<Report> {
     Some(result)
 }
 
-struct Worker<'a> {
-    oid_receiver: crossbeam_channel::Receiver<git2::Oid>,
-    commit_message_receiver: crossbeam_channel::Receiver<String>,
-    commit_message_sender: crossbeam_channel::Sender<String>,
-    report_sender: crossbeam_channel::Sender<Option<Report>>,
-    repo: &'a git2::Repository,
+fn find_latest_tag_commit_id(
+    repo: &git2::Repository,
+) -> Result<Option<git2::Oid>, Box<std::error::Error>> {
+    let tags = repo.tag_names(None)?;
+    let mut reports: Vec<git2::Commit> = tags
+        .iter()
+        .filter(|possible_tag| possible_tag.is_some())
+        .map(|t| t.unwrap())
+        .filter_map(|raw_tag| {
+            repo.revparse_single(raw_tag)
+                .expect("unable to find reference for tag")
+                .peel_to_commit()
+                .ok()
+        })
+        .collect();
+    reports.sort_by(|a, b| a.time().seconds().cmp(&b.time().seconds()));
+
+    let possible_latest_tag = reports.last();
+    if possible_latest_tag.is_none() {
+        return Ok(None);
+    }
+    let latest_tag = possible_latest_tag.unwrap();
+    Ok(Some(latest_tag.id()))
 }
 
-impl<'a> Worker<'a> {
-    fn run(&self) {
-        crossbeam_channel::select! {
-            recv(self.oid_receiver) -> possible_oid => {
-                let oid = possible_oid.expect("unable to receive oid");
-                let result = self.process_commit(oid);
-                if result.is_err() {
-                    panic!("error while commit lookup: {}",result.err().unwrap());
-                }
+struct Worker {
+    oid_receiver: crossbeam_channel::Receiver<git2::Oid>,
+    report_sender: crossbeam_channel::Sender<Report>,
+    repo: git2::Repository,
+}
+
+impl Worker {
+    fn run(self) {
+        loop {
+            let possible_oid = self.oid_receiver.recv();
+            if possible_oid.is_err() {
+                drop(self.report_sender);
+                return;
             }
-        };
+            let oid = possible_oid.unwrap();
+            let result = self.process_commit(oid);
+            if result.is_err() {
+                panic!("error while commit lookup: {}", result.err().unwrap());
+            }
+        }
     }
 
     fn process_commit(&self, oid: git2::Oid) -> Result<(), Box<std::error::Error>> {
@@ -158,15 +195,17 @@ impl<'a> Worker<'a> {
         if message == "" {
             return Ok(());
         }
-        self.commit_message_sender
-            .send(commit.message().unwrap_or("").to_string())?;
+        let possible_report = parse_report(message);
+        if possible_report.is_some() {
+            self.report_sender.send(possible_report.unwrap())?;
+        }
         Ok(())
     }
 }
 
 fn parse_array(input: &str) -> Vec<String> {
     lazy_static! {
-        static ref CLEANER: Regex = Regex::new(r"\s+-\s+").unwrap();
+        static ref CLEANER: Regex = Regex::new(r"\s+-\s+").expect("unable to parse array regex");
     }
     CLEANER
         .split(input)
